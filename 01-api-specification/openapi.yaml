@@ -1,0 +1,149 @@
+openapi: 3.0.3
+info:
+  title: Document Processing Service API
+  version: 1.0.0
+  description: |
+    Сервис первичной валидации, обработки и постановки документов в очередь на факсимильное подписание.
+    
+    ### Особенности:
+    * Метод создания ресурса поддерживает **идемпотентность** через заголовок `X-Idempotency-Key`.
+    * Все ошибки возвращаются в едином стандарте **RFC 7807 (Problem Details)**.
+
+servers:
+  - url: https://api-stage.bank.internal/v1
+    description: Тестовый контур (Stage)
+
+paths:
+  /documents/process:
+    post:
+      summary: Создание и отправка документа на процессинг
+      description: |
+        Принимает бинарные данные документа в формате Base64 и метаданные. 
+        При повторном запросе с тем же `X-Idempotency-Key` дубликат не создается.
+      operationId: processDocument
+      tags:
+        - Documents
+      parameters:
+        - name: X-Idempotency-Key
+          in: header
+          required: true
+          description: Уникальный UUID v4 для защиты от дублирования операций.
+          schema:
+            type: string
+            format: uuid
+            example: "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocumentProcessRequest'
+      responses:
+        '201':
+          description: Документ успешно принят в обработку
+          headers:
+            Location:
+              description: Ссылка на проверку статуса обработки
+              schema:
+                type: string
+                example: "/documents/doc_987654321/status"
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentProcessResponse'
+        '400':
+          description: Некорректный синтаксис JSON
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '401':
+          description: Не передан или невалиден JWT токен
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '422':
+          description: Ошибка бизнес-валидации (размер файла, некорректный enum)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+              example:
+                type: "https://api.bank.internal/errors/unprocessable-entity"
+                title: "Validation Failed"
+                status: 422
+                detail: "Размер файла превышает допустимый лимит 15MB"
+                invalidParams:
+                  - field: "payloadBase64"
+                    reason: "Current size 18.2MB exceeds max allowed 15MB"
+
+components:
+  schemas:
+    DocumentProcessRequest:
+      type: object
+      required:
+        - externalId
+        - docType
+        - payloadBase64
+      properties:
+        externalId:
+          type: string
+          description: Идентификатор заявки во внешней CRM-системе
+          example: "CRM-DOC-10928"
+        docType:
+          type: string
+          description: Тип документа
+          enum: [LOAN_AGREEMENT, MORTGAGE_CONTRACT, ADDITIONAL_ANNEX]
+          example: "LOAN_AGREEMENT"
+        payloadBase64:
+          type: string
+          format: byte
+          description: PDF-файл в кодировке Base64. Максимальный размер 15 МБ.
+          example: "JVBERi0xLjQKJcOkw7zDtsOf..."
+
+    DocumentProcessResponse:
+      type: object
+      properties:
+        documentId:
+          type: string
+          description: Внутренний ID созданного документа
+          example: "doc_987654321"
+        status:
+          type: string
+          description: Текущий статус в пайплайне
+          enum: [PROCESSING, COMPLETED, FAILED]
+          example: "PROCESSING"
+        createdAt:
+          type: string
+          format: date-time
+          example: "2024-03-15T11:42:00Z"
+
+    ProblemDetails:
+      type: object
+      description: Схема ошибки по стандарту RFC 7807
+      properties:
+        type:
+          type: string
+          format: uri
+          example: "https://api.bank.internal/errors/bad-request"
+        title:
+          type: string
+          example: "Bad Request"
+        status:
+          type: integer
+          example: 400
+        detail:
+          type: string
+          example: "Некорректный синтаксис JSON в теле запроса"
+        invalidParams:
+          type: array
+          items:
+            type: object
+            properties:
+              field:
+                type: string
+                example: "payloadBase64"
+              reason:
+                type: string
+                example: "Invalid base64 encoding"
