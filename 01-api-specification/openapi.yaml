@@ -7,6 +7,7 @@ info:
     
     ### Особенности:
     * Метод создания ресурса поддерживает **идемпотентность** через заголовок `X-Idempotency-Key`.
+    * Ограничение частоты вызовов (Rate Limiting): до 60 запросов в минуту.
     * Все ошибки возвращаются в едином стандарте **RFC 7807 (Problem Details)**.
 
 servers:
@@ -19,7 +20,10 @@ paths:
       summary: Создание и отправка документа на процессинг
       description: |
         Принимает бинарные данные документа в формате Base64 и метаданные. 
-        При повторном запросе с тем же `X-Idempotency-Key` дубликат не создается.
+        
+        **Поведение:**
+        * При первичном вызове документ регистрируется в системе со статусом `PROCESSING`.
+        * При повторном запросе с тем же `X-Idempotency-Key` в течение 24 часов дубликат не создается, возвращается результат первой обработки.
       operationId: processDocument
       tags:
         - Documents
@@ -27,13 +31,14 @@ paths:
         - name: X-Idempotency-Key
           in: header
           required: true
-          description: Уникальный UUID v4 для защиты от дублирования операций.
+          description: Уникальный ключ запроса (UUID v4) для защиты от повторных списаний/созданий при сетевых сбоях.
           schema:
             type: string
             format: uuid
             example: "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d"
       requestBody:
         required: true
+        description: Метаданные и бинарное содержимое подписываемого документа
         content:
           application/json:
             schema:
@@ -43,7 +48,7 @@ paths:
           description: Документ успешно принят в обработку
           headers:
             Location:
-              description: Ссылка на проверку статуса обработки
+              description: Относительный URI для проверки статуса сформированного документа
               schema:
                 type: string
                 example: "/documents/doc_987654321/status"
@@ -52,19 +57,19 @@ paths:
               schema:
                 $ref: '#/components/schemas/DocumentProcessResponse'
         '400':
-          description: Некорректный синтаксис JSON
+          description: Некорректный синтаксис JSON или поврежденные данные
           content:
             application/problem+json:
               schema:
                 $ref: '#/components/schemas/ProblemDetails'
         '401':
-          description: Не передан или невалиден JWT токен
+          description: Не передан, просрочен или невалиден JWT токен в заголовке Authorization
           content:
             application/problem+json:
               schema:
                 $ref: '#/components/schemas/ProblemDetails'
         '422':
-          description: Ошибка бизнес-валидации (размер файла, некорректный enum)
+          description: Ошибка валидации бизнес-правил (недопустимый размер, поврежденный PDF)
           content:
             application/problem+json:
               schema:
@@ -76,7 +81,24 @@ paths:
                 detail: "Размер файла превышает допустимый лимит 15MB"
                 invalidParams:
                   - field: "payloadBase64"
-                    reason: "Current size 18.2MB exceeds max allowed 15MB"
+                    reason: "Размер файла 18.2MB превышает максимально допустимый лимит 15MB"
+        '429':
+          description: Превышен лимит запросов (Rate Limit). Сервис временно блокирует вызовы
+          headers:
+            Retry-After:
+              description: Время ожидания в секундах до возможности повторить запрос
+              schema:
+                type: integer
+                example: 60
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+              example:
+                type: "https://api.bank.internal/errors/too-many-requests"
+                title: "Too Many Requests"
+                status: 429
+                detail: "Превышен лимит вызовов (максимум 60 req/min). Повторите запрос через 60 секунд."
 
 components:
   schemas:
@@ -89,61 +111,102 @@ components:
       properties:
         externalId:
           type: string
-          description: Идентификатор заявки во внешней CRM-системе
+          minLength: 3
+          maxLength: 64
+          pattern: '^[A-Z0-9_-]+$'
+          description: |
+            Уникальный номер заявки во внешней CRM-системе клиента.
+            Допустимы заглавные латинские буквы, цифры, знаки тире и подчеркивания.
           example: "CRM-DOC-10928"
         docType:
           type: string
-          description: Тип документа
-          enum: [LOAN_AGREEMENT, MORTGAGE_CONTRACT, ADDITIONAL_ANNEX]
+          description: |
+            Тип загружаемого документа:
+            * `LOAN_AGREEMENT` — Кредитный договор наличными или на карту.
+            * `MORTGAGE_CONTRACT` — Договор ипотечного кредитования.
+            * `ADDITIONAL_ANNEX` — Дополнительное соглашение или приложение к договору.
+          enum:
+            - LOAN_AGREEMENT
+            - MORTGAGE_CONTRACT
+            - ADDITIONAL_ANNEX
           example: "LOAN_AGREEMENT"
         payloadBase64:
           type: string
           format: byte
-          description: PDF-файл в кодировке Base64. Максимальный размер 15 МБ.
+          description: |
+            Содержимое документа строго в формате PDF, закодированное в строку Base64.
+            Максимальный размер исходного файла — не более 15 МБ.
           example: "JVBERi0xLjQKJcOkw7zDtsOf..."
 
     DocumentProcessResponse:
       type: object
+      required:
+        - documentId
+        - status
+        - createdAt
       properties:
         documentId:
           type: string
-          description: Внутренний ID созданного документа
+          pattern: '^doc_[0-9]{9}$'
+          description: Внутренний уникальный идентификатор документа в сервисе процессинга.
           example: "doc_987654321"
         status:
           type: string
-          description: Текущий статус в пайплайне
-          enum: [PROCESSING, COMPLETED, FAILED]
+          description: |
+            Текущий статус документа в очереди на обработку:
+            * `PROCESSING` — Документ принят, идет валидация подписей и постановка в очередь.
+            * `COMPLETED` — Обработка завершена, факсимиле успешно наложено.
+            * `FAILED` — Ошибка при наложении факсимиле или файл поврежден.
+          enum:
+            - PROCESSING
+            - COMPLETED
+            - FAILED
           example: "PROCESSING"
         createdAt:
           type: string
           format: date-time
+          description: Дата и время постановки в очередь в формате ISO 8601 (UTC).
           example: "2024-03-15T11:42:00Z"
 
     ProblemDetails:
       type: object
-      description: Схема ошибки по стандарту RFC 7807
+      description: Схема ошибки в соответствии со спецификацией RFC 7807 (Problem Details for HTTP APIs).
+      required:
+        - type
+        - title
+        - status
       properties:
         type:
           type: string
           format: uri
+          description: URI-ссылка на страницу с подробным описанием ошибки.
           example: "https://api.bank.internal/errors/bad-request"
         title:
           type: string
+          description: Краткое человекочитаемое резюме типа ошибки.
           example: "Bad Request"
         status:
           type: integer
+          description: Код статуса HTTP, возвращенный сервером.
           example: 400
         detail:
           type: string
+          description: Детальное описание конкретной причины сбоя в данном запросе.
           example: "Некорректный синтаксис JSON в теле запроса"
         invalidParams:
           type: array
+          description: Список полей, не прошедших валидацию (при наличии).
           items:
             type: object
+            required:
+              - field
+              - reason
             properties:
               field:
                 type: string
+                description: Имя поля с некорректным значением
                 example: "payloadBase64"
               reason:
                 type: string
-                example: "Invalid base64 encoding"
+                description: Описание причины отклонения значения
+                example: "Неверная кодировка Base64 или поврежденные байты"
